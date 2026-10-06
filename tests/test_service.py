@@ -1572,6 +1572,293 @@ class ClosurePlanTests(unittest.TestCase):
         self.assertEqual(service.list_history("PL-E3"), before)
 
 
+class CoverageTests(unittest.TestCase):
+    """跨规程版本覆盖检查：调度员安排跨规程作业前的逐片段覆盖核对。"""
+
+    def setUp(self):
+        reset_db()
+
+    def _now(self) -> str:
+        # 服务端发布时钟单调递增；略作停顿确保知悉时刻不早于发布时刻
+        import time as _time
+        _time.sleep(0.002)
+        return now_canonical()
+
+    def _cov(self, numbers, start=t1, end=t5, known=None):
+        return service.check_coverage(numbers, start, end,
+                                      known or self._now())
+
+    # ---- 切分、版本切换与合并 --------------------------------------------
+
+    def test_single_segment_when_nothing_changes(self):
+        release("CV-A", body="A0")
+        release("CV-B", body="B0")
+        res = self._cov(["CV-A", "CV-B"])
+        self.assertTrue(res["covered"])
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["numbers"], ["CV-A", "CV-B"])
+        self.assertEqual(res["work_start"], canon(t1))
+        self.assertEqual(res["work_end"], canon(t5))
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t1), canon(t5)))
+        self.assertTrue(seg["covered"])
+        self.assertEqual(seg["switches"], [])
+        self.assertEqual([(i["number"], i["revision"], i["gap"])
+                          for i in seg["items"]],
+                         [("CV-A", 0, None), ("CV-B", 0, None)])
+
+    def test_version_switch_splits_segments_and_marks(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "A1")
+        res = self._cov(["CV-A"])
+        self.assertTrue(res["covered"])
+        self.assertEqual(res["count"], 3)
+        segs = res["segments"]
+        self.assertEqual([(s["start"], s["end"]) for s in segs],
+                         [(canon(t1), canon(t2)),
+                          (canon(t2), canon(t3)),
+                          (canon(t3), canon(t5))])
+        self.assertEqual([s["items"][0]["revision"] for s in segs], [0, 1, 0])
+        # 版本切换标在边界后的片段上；首段为空
+        self.assertEqual([s["switches"] for s in segs],
+                         [[], ["CV-A"], ["CV-A"]])
+        # 首尾两段整组结果完全相同但不相邻 -> 不跨段合并
+        self.assertEqual(segs[0]["items"], segs[2]["items"])
+
+    def test_endpoints_union_across_numbers(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "A1")          # A 的切换点 t2/t3
+        release("CV-B", body="B0")
+        correct("CV-B", 0, t3, t4, "B1")          # B 的切换点 t3/t4
+        res = self._cov(["CV-A", "CV-B"])
+        # 全体端点共同切分：t1..t2..t3..t4..t5 共 4 段
+        self.assertEqual(res["count"], 4)
+        self.assertEqual(
+            [[(i["number"], i["revision"]) for i in s["items"]]
+             for s in res["segments"]],
+            [[("CV-A", 0), ("CV-B", 0)],
+             [("CV-A", 1), ("CV-B", 0)],
+             [("CV-A", 0), ("CV-B", 1)],
+             [("CV-A", 0), ("CV-B", 0)]])
+        self.assertEqual([s["switches"] for s in res["segments"]],
+                         [[], ["CV-A"], ["CV-A", "CV-B"], ["CV-B"]])
+
+    def test_segments_cover_full_window_without_overlap(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "A1")
+        release("CV-B", body="B0", start=t2, end=t4)
+        res = self._cov(["CV-A", "CV-B"])
+        self.assertEqual(res["segments"][0]["start"], canon(t1))
+        self.assertEqual(res["segments"][-1]["end"], canon(t5))
+        for a, b in zip(res["segments"], res["segments"][1:]):
+            self.assertEqual(a["end"], b["start"])
+
+    def test_window_clipped_to_requested_interval(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t4, "A1")
+        res = self._cov(["CV-A"], start=t3, end=t5)
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t3), canon(t4)), (canon(t4), canon(t5))])
+
+    def test_versions_outside_window_do_not_split(self):
+        far_end = iso(_T + timedelta(days=400))
+        release("CV-A", body="A0", start=t1, end=far_end)
+        correct("CV-A", 0, t5, far_end, "区间外更正")
+        res = self._cov(["CV-A"], start=t1, end=t5)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["items"][0]["revision"], 0)
+
+    def test_versions_published_after_known_time_ignored(self):
+        release("CV-A", body="A0")
+        published = correct("CV-A", 0, t2, t3, "A1")["published_at"]
+        # 知悉时刻卡在更正发布前一微秒：更正不可见、其端点不产生片段
+        dt = datetime.strptime(published, "%Y-%m-%dT%H:%M:%S.%fZ")
+        before = (dt - timedelta(microseconds=1)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%fZ")
+        res = self._cov(["CV-A"], known=before)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["items"][0]["revision"], 0)
+
+    def test_half_open_boundary(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "A1")
+        # 左闭右开：t2 起适用 r1，t3 起恢复 r0
+        res = self._cov(["CV-A"], start=t2, end=t3)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["items"][0]["revision"], 1)
+
+    def test_numbers_order_preserved(self):
+        release("CV-A", body="A0")
+        release("CV-B", body="B0")
+        res = self._cov(["CV-B", "CV-A"])
+        self.assertEqual(res["numbers"], ["CV-B", "CV-A"])
+        self.assertEqual([i["number"] for i in res["segments"][0]["items"]],
+                         ["CV-B", "CV-A"])
+
+    def test_item_payload_complete(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "A1")
+        res = self._cov(["CV-A"])
+        it = res["segments"][1]["items"][0]
+        self.assertEqual(it["number"], "CV-A")
+        self.assertEqual(it["revision"], 1)
+        self.assertEqual(it["body"], "A1")
+        self.assertEqual(it["valid_start"], canon(t2))
+        self.assertEqual(it["valid_end"], canon(t3))
+        self.assertEqual(it["supersedes_revision"], 0)
+        self.assertTrue(it["published_at"].endswith("Z"))
+        self.assertFalse(it["restored_by_withdrawal"])
+        self.assertIsNone(it["gap"])
+
+    # ---- 区间外空档 -------------------------------------------------------
+
+    def test_out_of_coverage_gap_marked(self):
+        release("CV-A", body="A0")
+        release("CV-B", body="仅三月", start=t2, end=t3)
+        res = self._cov(["CV-A", "CV-B"])
+        self.assertFalse(res["covered"])
+        self.assertEqual(res["count"], 3)
+        segs = res["segments"]
+        self.assertEqual([s["covered"] for s in segs], [False, True, False])
+        # 进入/离开空档都算适用状态切换
+        self.assertEqual([s["switches"] for s in segs],
+                         [[], ["CV-B"], ["CV-B"]])
+        gap_item = segs[0]["items"][1]
+        self.assertEqual(gap_item["gap"], "no_applicable_version")
+        self.assertIsNone(gap_item["revision"])
+        self.assertIsNone(gap_item["body"])
+        self.assertIsNone(gap_item["valid_start"])
+        self.assertIsNone(gap_item["valid_end"])
+        self.assertIsNone(gap_item["supersedes_revision"])
+        self.assertIsNone(gap_item["published_at"])
+        self.assertFalse(gap_item["restored_by_withdrawal"])
+        self.assertIsNone(segs[1]["items"][1]["gap"])
+
+    def test_not_yet_published_is_single_gap_segment(self):
+        release("CV-A", body="A0")
+        res = self._cov(["CV-A"], known=t0)     # 知悉时刻早于发布
+        self.assertEqual(res["count"], 1)
+        self.assertFalse(res["covered"])
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t1), canon(t5)))
+        self.assertEqual(seg["items"][0]["gap"], "no_applicable_version")
+
+    # ---- 因撤回导致的恢复 -------------------------------------------------
+
+    def test_withdrawal_restoration_marked(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "误发更正")
+        withdraw("CV-A", 1)
+        res = self._cov(["CV-A"])
+        self.assertTrue(res["covered"])
+        # 撤回版本的端点仍切分区间：恢复标记不同 -> 相邻段不合并
+        self.assertEqual(res["count"], 3)
+        segs = res["segments"]
+        self.assertEqual([s["items"][0]["revision"] for s in segs], [0, 0, 0])
+        self.assertEqual([s["items"][0]["restored_by_withdrawal"]
+                          for s in segs], [False, True, False])
+        self.assertEqual(segs[1]["items"][0]["body"], "A0")
+        # 恢复边界上版本号未变 -> 不是版本切换
+        self.assertEqual([s["switches"] for s in segs], [[], [], []])
+
+    def test_known_before_withdrawal_keeps_correction(self):
+        release("CV-A", body="A0")
+        published = correct("CV-A", 0, t2, t3, "A1")["published_at"]
+        withdrawn_at = withdraw("CV-A", 1)["withdrawn_at"]
+        # 撤回前的知悉时刻：r1 可见、无恢复标记（历史不变）
+        res = self._cov(["CV-A"], known=published)
+        self.assertEqual([s["items"][0]["revision"] for s in res["segments"]],
+                         [0, 1, 0])
+        self.assertFalse(any(s["items"][0]["restored_by_withdrawal"]
+                             for s in res["segments"]))
+        # 撤回时刻本身（含等号）：r1 仍可见
+        res = self._cov(["CV-A"], known=withdrawn_at)
+        self.assertEqual([s["items"][0]["revision"] for s in res["segments"]],
+                         [0, 1, 0])
+
+    def test_re_correction_after_withdrawal_is_not_restored(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "误发更正")
+        withdraw("CV-A", 1)
+        correct("CV-A", 0, t2, t3, "重新更正")   # r2 覆盖同一区间
+        res = self._cov(["CV-A"])
+        self.assertEqual([s["items"][0]["revision"] for s in res["segments"]],
+                         [0, 2, 0])
+        self.assertEqual([s["items"][0]["restored_by_withdrawal"]
+                          for s in res["segments"]], [False, False, False])
+        self.assertEqual([s["switches"] for s in res["segments"]],
+                         [[], ["CV-A"], ["CV-A"]])
+
+    # ---- 非法入参：拒绝且不写历史 -----------------------------------------
+
+    def test_duplicate_numbers_rejected(self):
+        release("CV-A")
+        with self.assertRaises(DomainError) as ctx:
+            self._cov(["CV-A", "CV-A"])
+        self.assertEqual(ctx.exception.code, "duplicate_coverage_number")
+        self.assertEqual(ctx.exception.http_status, 422)
+        self.assertEqual(ctx.exception.details, {"number": "CV-A", "index": 1})
+
+    def test_blank_number_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._cov(["   "])
+        self.assertEqual(ctx.exception.code, "invalid_number")
+        self.assertEqual(ctx.exception.details["index"], 0)
+
+    def test_empty_numbers_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._cov([])
+        self.assertEqual(ctx.exception.code, "validation_error")
+
+    def test_unknown_number_rejected(self):
+        release("CV-A")
+        with self.assertRaises(DomainError) as ctx:
+            self._cov(["CV-A", "NOPE"])
+        self.assertEqual(ctx.exception.code, "procedure_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        self.assertEqual(ctx.exception.details, {"number": "NOPE", "index": 1})
+
+    def test_invalid_times_rejected(self):
+        release("CV-A")
+        for overrides, field in [
+                ({"start": "2026-01-01T00:00:00"}, "work_start"),
+                ({"end": "2027-01-01T00:00:00"}, "work_end"),
+                ({"known": "2026-01-01T00:00:00"}, "known_as_of")]:
+            with self.assertRaises(DomainError) as ctx:
+                self._cov(["CV-A"], **overrides)
+            self.assertEqual(ctx.exception.code, "invalid_time")
+            self.assertEqual(ctx.exception.details["field"], field)
+
+    def test_invalid_interval_rejected(self):
+        release("CV-A")
+        for s, e in [(t2, t2), (t3, t2)]:
+            with self.assertRaises(DomainError) as ctx:
+                self._cov(["CV-A"], start=s, end=e)
+            self.assertEqual(ctx.exception.code, "invalid_interval")
+
+    def test_known_as_of_in_future_rejected(self):
+        release("CV-A")
+        with self.assertRaises(DomainError) as ctx:
+            self._cov(["CV-A"], known=future)
+        self.assertEqual(ctx.exception.code, "known_as_of_in_future")
+        self.assertEqual(ctx.exception.http_status, 422)
+
+    def test_read_only_on_success_and_error(self):
+        release("CV-A", body="A0")
+        correct("CV-A", 0, t2, t3, "A1")
+        before_hist = service.list_history("CV-A")
+        before_feed = service.read_change_feed(None, 1000)
+        res = self._cov(["CV-A"])
+        self.assertEqual(res["count"], 3)
+        with self.assertRaises(DomainError):
+            self._cov(["CV-A", "NOPE"])
+        with self.assertRaises(DomainError):
+            self._cov(["CV-A"], known=future)
+        # 成功与失败的覆盖检查都不改变历史（版本与审计日志原样）
+        self.assertEqual(service.list_history("CV-A"), before_hist)
+        self.assertEqual(service.read_change_feed(None, 1000), before_feed)
+
+
 def pitem(number: str, base: int, start: str, end: str, body: str = "预演更正",
           prerequisites=None):
     return item(number, body, start, end, base, prerequisites=prerequisites)
@@ -2267,7 +2554,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.json()["error"]["code"],
                          "duplicate_prerequisite_number")
         r = c.post("/api/v1/releases", json={
-            "number": self._n(), "body": "旧式", "valid_start": t1,
+            "number": self._n() + "-OLD", "body": "旧式", "valid_start": t1,
             "valid_end": t5})
         self.assertEqual(r.status_code, 201)
         self.assertEqual(r.json()["items"][0]["prerequisites"], [])
@@ -2396,6 +2683,102 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 422)
         self.assertEqual(r.json()["error"]["code"], "validation_error")
         # 错误不写历史
+        self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
+                         .json()["count"], 1)
+
+    def test_coverage_over_http(self):
+        c = self.client
+        n1, n2 = self._n() + "-1", self._n() + "-2"
+        c.post("/api/v1/releases", json={
+            "number": n1, "body": "A0", "valid_start": t1, "valid_end": t5})
+        c.post("/api/v1/corrections", json={
+            "number": n1, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "A1"})
+        c.post("/api/v1/releases", json={
+            "number": n2, "body": "仅三月", "valid_start": t2, "valid_end": t3})
+        # 撤回 n1 的更正：3 月恢复 r0（restored_by_withdrawal）
+        c.post("/api/v1/withdrawals", json={"number": n1, "revision": 1})
+
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1, n2], "work_start": t1, "work_end": t5,
+            "known_as_of": now_canonical()})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["numbers"], [n1, n2])
+        self.assertFalse(body["covered"])
+        self.assertEqual(body["count"], 3)
+        segs = body["segments"]
+        self.assertEqual([(s["start"], s["end"]) for s in segs],
+                         [(canon(t1), canon(t2)),
+                          (canon(t2), canon(t3)),
+                          (canon(t3), canon(t5))])
+        # 逐段：n1 全年 r0（3 月为撤回恢复），n2 仅 3 月有正文
+        self.assertEqual(
+            [[(i["number"], i["revision"], i["restored_by_withdrawal"],
+               i["gap"]) for i in s["items"]] for s in segs],
+            [[(n1, 0, False, None), (n2, None, False,
+                                      "no_applicable_version")],
+             [(n1, 0, True, None), (n2, 0, False, None)],
+             [(n1, 0, False, None), (n2, None, False,
+                                      "no_applicable_version")]])
+        self.assertEqual([s["covered"] for s in segs], [False, True, False])
+        self.assertEqual([s["switches"] for s in segs],
+                         [[], [n2], [n2]])
+        # 片段项带完整版本字段
+        it = segs[1]["items"][0]
+        self.assertEqual(it["body"], "A0")
+        self.assertEqual(it["supersedes_revision"], None)
+        self.assertTrue(it["published_at"].endswith("Z"))
+
+    def test_coverage_errors_over_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "A0", "valid_start": t1, "valid_end": t5})
+        base = {"numbers": [n], "work_start": t1, "work_end": t5,
+                "known_as_of": now_canonical()}
+
+        # 编号重复 -> 422 duplicate_coverage_number
+        r = c.post("/api/v1/coverage/check",
+                   json={**base, "numbers": [n, n]})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"],
+                         "duplicate_coverage_number")
+        # 编号不存在 -> 404 procedure_not_found（details 带 index）
+        r = c.post("/api/v1/coverage/check",
+                   json={**base, "numbers": [n, "NO-SUCH"]})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "procedure_not_found")
+        self.assertEqual(r.json()["error"]["details"]["index"], 1)
+        # 空编号列表 -> 422 validation_error
+        r = c.post("/api/v1/coverage/check", json={**base, "numbers": []})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+        # 空作业区间 -> 422 invalid_interval
+        r = c.post("/api/v1/coverage/check",
+                   json={**base, "work_start": t2, "work_end": t2})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+        # 缺时区 -> 422 invalid_time
+        r = c.post("/api/v1/coverage/check",
+                   json={**base, "known_as_of": "2026-01-01T00:00:00"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_time")
+        # 知悉时刻晚于当前时刻 -> 422 known_as_of_in_future
+        r = c.post("/api/v1/coverage/check",
+                   json={**base, "known_as_of": "2999-01-01T00:00:00Z"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "known_as_of_in_future")
+        # 缺少必填字段 / 额外字段 -> 422 validation_error
+        r = c.post("/api/v1/coverage/check",
+                   json={"numbers": [n], "work_start": t1})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+        r = c.post("/api/v1/coverage/check",
+                   json={**base, "created_at": "2026-01-01T00:00:00Z"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+        # 全部错误均只读：历史不变
         self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
                          .json()["count"], 1)
 

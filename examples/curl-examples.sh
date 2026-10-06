@@ -653,3 +653,104 @@ curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=99999999"; echo
 # --- 41b. 非法上限（0 / 超过 1000） -> 422 invalid_page_limit ---------------
 curl -sS -i "$BASE_URL/api/v1/audit/events?limit=0"; echo
 curl -sS -i "$BASE_URL/api/v1/audit/events?limit=1001"; echo
+
+# ------------------------------------------------------------------------
+# 跨规程版本覆盖检查（本轮新增）：调度员在安排跨规程作业前，检查一组规程
+# 编号在整个非空作业区间内的版本覆盖。服务在同一只读快照内按全体适用版本
+# 端点切分区间，逐段返回每个编号的有效版本号、正文或缺口，并标出因撤回
+# 导致的恢复（restored_by_withdrawal）、区间外空档（gap）与版本切换
+# （switches）；相邻段仅在整组结果完全相同时合并。只读、不写历史。
+# ------------------------------------------------------------------------
+
+# --- 42. 准备数据：SOP-COV-001 全年适用（3 月更正随后被撤回），
+#         SOP-COV-002 仅 3 月适用 ---------------------------------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-COV-001",
+        "body": "初版正文：进入车间必须佩戴护目镜。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-COV-001",
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "误发布的 3 月更正。"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-COV-002",
+        "body": "仅 3 月适用的规程。",
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-COV-001", "revision": 1}'; echo
+
+# --- 43a. 全年覆盖检查：3 月片段 SOP-COV-001 标 restored_by_withdrawal，
+#         SOP-COV-002 仅 3 月有正文，其余片段为区间外空档 -----------------
+# 知悉时刻不得晚于服务端当前时刻，取运行时 UTC（先停顿 1 秒，保证不早于
+# 上面的发布/撤回时刻——服务端时刻带微秒）。
+sleep 1
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+curl -sS -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-002\"],
+        \"work_start\": \"2026-01-01T00:00:00Z\",
+        \"work_end\":   \"2027-01-01T00:00:00Z\",
+        \"known_as_of\": \"$NOW\"
+      }" | python3 -m json.tool
+
+# --- 43b. 收窄作业区间到 3 月：端点裁剪，单片段且 covered=true ----------
+curl -sS -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-002\"],
+        \"work_start\": \"2026-03-01T00:00:00Z\",
+        \"work_end\":   \"2026-04-01T00:00:00Z\",
+        \"known_as_of\": \"$NOW\"
+      }" | python3 -m json.tool
+
+# --- 44a. 编号重复 -> 422 duplicate_coverage_number ----------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-001\"],
+        \"work_start\": \"2026-01-01T00:00:00Z\",
+        \"work_end\":   \"2027-01-01T00:00:00Z\",
+        \"known_as_of\": \"$NOW\"
+      }"; echo
+# --- 44b. 编号不存在 -> 404 procedure_not_found --------------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-NOPE\"],
+        \"work_start\": \"2026-01-01T00:00:00Z\",
+        \"work_end\":   \"2027-01-01T00:00:00Z\",
+        \"known_as_of\": \"$NOW\"
+      }"; echo
+# --- 44c. 知悉时刻晚于当前时刻 -> 422 known_as_of_in_future --------------
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "numbers": ["SOP-COV-001"],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "known_as_of": "2030-01-01T00:00:00Z"
+      }'; echo
+# --- 44d. 空作业区间（起=止） -> 422 invalid_interval --------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\"],
+        \"work_start\": \"2026-03-01T00:00:00Z\",
+        \"work_end\":   \"2026-03-01T00:00:00Z\",
+        \"known_as_of\": \"$NOW\"
+      }"; echo

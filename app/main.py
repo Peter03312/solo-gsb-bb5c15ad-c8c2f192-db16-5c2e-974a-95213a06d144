@@ -11,7 +11,7 @@ from .config import settings
 from .db import init_db
 from .errors import DomainError
 from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewBatch,
-                      CorrectionPreviewItem, PackageRequest,
+                      CorrectionPreviewItem, CoverageRequest, PackageRequest,
                       ReleaseBatch, ReleaseItem, WithdrawalBatch,
                       WithdrawalItem)
 
@@ -22,7 +22,8 @@ app = FastAPI(
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
                  "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性），"
-                 "以及多条更正正式提交前的只读批量预演（不写历史、不占版本号）。"),
+                 "多条更正正式提交前的只读批量预演（不写历史、不占版本号），"
+                 "以及跨规程作业前的版本覆盖检查（逐片段有效版本/缺口）。"),
 )
 
 
@@ -72,6 +73,7 @@ def index() -> dict:
                 "GET  /api/v1/procedures/{number}/diff",
                 "GET  /api/v1/procedures/{number}/closure",
                 "GET  /api/v1/procedures/{number}/closure-plan",
+                "POST /api/v1/coverage/check",
                 "GET  /api/v1/audit/events",
             ]}
 
@@ -229,6 +231,21 @@ def review_package(package_id: str, known_as_of: str) -> dict:
     缺时区）-> 422。
     """
     return service.review_package(package_id, known_as_of)
+
+
+@app.post("/api/v1/coverage/check", status_code=200)
+async def coverage_check(req: CoverageRequest) -> dict:
+    """跨规程版本覆盖检查：调度员在安排跨规程作业前，检查一组规程编号在
+    整个非空作业区间内的版本覆盖（只读，不改变历史）。
+
+    在同一只读快照内收集各编号在知悉时刻可见的适用版本端点，按全体端点
+    切分作业区间，逐段返回每个编号的有效版本号、正文或缺口，并标出因撤回
+    导致的恢复（restored_by_withdrawal）、区间外空档（gap）与版本切换
+    （switches）；相邻段仅在整组结果完全相同时合并。编号不存在 -> 404；
+    时间非法/空区间/编号重复/知悉时刻晚于当前时刻 -> 422。
+    """
+    return service.check_coverage(req.numbers, req.work_start, req.work_end,
+                                  req.known_as_of)
 
 
 @app.get("/api/v1/audit/events")

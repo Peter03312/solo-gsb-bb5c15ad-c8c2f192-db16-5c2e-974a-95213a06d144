@@ -81,6 +81,19 @@
 - 预演**全程只读**：不写版本、不占版本号、不推进服务端时钟、不改变历史
   （连正式提交与预演共用的应用逻辑也跑在副本上）；正式提交仍须按提交时
   的当时状态重新校验，预演结果不保证可提交。
+
+跨规程版本覆盖检查
+------------------
+调度员在安排跨规程作业前，用 check_coverage 检查一组规程编号在整个非空
+作业区间内的版本覆盖：
+
+- 在同一只读快照内收集各编号在知悉时刻可见的适用版本端点（含撤回已生效
+  版本的端点），按全体端点把作业区间切成互不重叠的左闭右开片段；
+- 逐片段返回每个编号的有效版本号、正文或缺口（no_applicable_version），
+  并标出因撤回导致的恢复（restored_by_withdrawal）、区间外空档与版本
+  切换（switches）；
+- 相邻片段仅在整组结果完全相同时合并；编号不存在、时间非法、知悉时刻
+  晚于当前时刻均拒绝；全程只读、不改变历史。
 """
 from __future__ import annotations
 
@@ -1333,6 +1346,205 @@ def resolve_closure_plan(number_raw: str,
             "count": len(segments),
             "available": all(seg["available"] for seg in segments),
             "segments": segments}
+
+
+# ---------------------------------------------------------------- 跨规程版本覆盖检查
+
+
+def check_coverage(numbers_raw: list, work_start_raw: str,
+                   work_end_raw: str, known_as_of_raw: str) -> dict:
+    """调度员在安排跨规程作业前检查版本覆盖（只读，不改变历史）。
+
+    输入一组**非空且不重复**的规程编号、非空作业区间
+    ``[work_start, work_end)`` 与知悉时刻；在**同一只读快照**内收集各编号
+    在该知悉时刻可见的适用版本端点（含撤回已生效版本的端点，用于标出恢复
+    区间边界），按全体端点把作业区间切成互不重叠、恰好覆盖全区间的左闭右
+    开片段；逐片段返回每个编号的有效版本号、正文或缺口，并标出：
+
+    * ``restored_by_withdrawal``：该片段的有效版本之所以适用，是因为覆盖
+      该片段的子更正在知悉时刻前已撤回、区间恢复由父版本持有（因撤回导致
+      的恢复）；
+    * ``gap = "no_applicable_version"``：该编号在片段内无适用正文
+      （区间外空档，含该知悉时刻下尚未发布）；
+    * ``switches``：与上一片段相比适用版本（含缺口状态）发生切换的编号
+      （首段为空列表）。
+
+    相邻片段仅在整组结果（全部编号的版本/正文/区间/恢复标记/缺口）完全
+    相同时才合并；被中间状态隔开的相同片段不跨段合并。编号不存在、时间
+    非法、空/倒置作业区间、知悉时刻晚于服务端当前时刻均拒绝；全程只读，
+    不写任何历史。
+    """
+    try:
+        work_start = parse_canonical(work_start_raw, "work_start")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_start"})
+    try:
+        work_end = parse_canonical(work_end_raw, "work_end")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_end"})
+    if not work_start < work_end:
+        raise errors.invalid_interval(
+            work_start, work_end,
+            "作业区间非法：work_start 必须严格早于 work_end（区间为 [起, 止) 且长度大于 0）")
+    try:
+        known_as_of = parse_canonical(known_as_of_raw, "known_as_of")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "known_as_of"})
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(numbers_raw):
+        number = raw.strip() if isinstance(raw, str) else ""
+        if not number:
+            raise DomainError("invalid_number", "规程编号不能为空字符串",
+                              422, {"field": "numbers", "index": i})
+        if number in seen:
+            raise errors.duplicate_coverage_number(number, i)
+        seen.add(number)
+        cleaned.append(number)
+    if not cleaned:
+        raise DomainError("validation_error", "规程编号列表不能为空",
+                          422, {"field": "numbers"})
+
+    with read_snapshot() as conn:
+        # 只读路径取墙上时钟作为"当前时刻"（与规程包复核一致），不触碰写
+        # 路径的共享单调状态，避免在只读事务内引入任何写侧副作用。
+        server_now = now_canonical()
+        if known_as_of > server_now:
+            raise errors.known_as_of_in_future(known_as_of, server_now)
+
+        # 存在性校验：任一编号不存在即整体拒绝（details 带 index/number）。
+        procs: list[sqlite3.Row] = []
+        for i, number in enumerate(cleaned):
+            proc = _fetch_procedure(conn, number)
+            if proc is None:
+                raise errors.coverage_procedure_not_found(number, i)
+            procs.append(proc)
+
+        # 逐规程收集该知悉时刻下参与切分与解析的数据：
+        # * visible：可见版本（published_at <= k 且未撤回或撤回不早于 k），
+        #   用于求有效版本；
+        # * 端点：全部已发布版本（published_at <= k）与作业区间相交的适用
+        #   区间端点——可见版本的端点是版本切换边界，撤回已生效版本的端点
+        #   标出"因撤回恢复"的边界；区间外的端点被裁剪、不产生片段；
+        # * withdrawn_effective：撤回已生效（published_at <= k 且
+        #   withdrawn_at < k）的版本 id，用于判定"因撤回导致的恢复"。
+        per_proc: list[dict] = []
+        bounds = {work_start, work_end}
+        for proc in procs:
+            all_rows = conn.execute(
+                "SELECT * FROM versions WHERE procedure_id = ?",
+                (proc["id"],)).fetchall()
+            by_id_all = {v["id"]: v for v in all_rows}
+            withdrawn = _withdrawn_map(conn, [v["id"] for v in all_rows])
+            visible = [v for v in all_rows
+                       if v["published_at"] <= known_as_of
+                       and (v["id"] not in withdrawn
+                            or withdrawn[v["id"]] >= known_as_of)]
+            for v in all_rows:
+                if v["published_at"] > known_as_of:
+                    continue                        # 知悉时刻之后才发布
+                if v["valid_end"] <= work_start or work_end <= v["valid_start"]:
+                    continue                        # 与作业区间不相交
+                bounds.add(max(v["valid_start"], work_start))
+                bounds.add(min(v["valid_end"], work_end))
+            children: dict[int, list[sqlite3.Row]] = {}
+            for v in all_rows:
+                pid = v["supersedes_id"]
+                if pid is not None:
+                    children.setdefault(pid, []).append(v)
+            per_proc.append({
+                "number": proc["number"],
+                "visible": visible,
+                "by_id": {v["id"]: v for v in visible},
+                "depth_cache": {},
+                "children": children,
+                "withdrawn_effective": {
+                    vid for vid, ts in withdrawn.items()
+                    if ts < known_as_of
+                    and by_id_all[vid]["published_at"] <= known_as_of},
+            })
+
+        # 逐片段（以左闭右开片段起点为代表作业时刻）求每个编号的有效版本；
+        # 片段内部各编号的适用版本与恢复标记均恒定（端点之外的变动不影响）。
+        ordered = sorted(bounds)
+        raw_segments: list[tuple[str, str, list[dict]]] = []
+        for s, e in zip(ordered, ordered[1:]):
+            items = [
+                _coverage_item(
+                    conn, entry,
+                    _effective_at(s, entry["visible"], entry["by_id"],
+                                  entry["depth_cache"]),
+                    s)
+                for entry in per_proc]
+            raw_segments.append((s, e, items))
+
+        # 相邻片段仅在整组结果（每个编号的版本/正文/区间/恢复标记/缺口）
+        # 完全相同时合并。
+        merged: list[tuple[str, str, list[dict]]] = []
+        for s, e, items in raw_segments:
+            if merged and merged[-1][1] == s and merged[-1][2] == items:
+                merged[-1] = (merged[-1][0], e, items)
+            else:
+                merged.append((s, e, items))
+
+        # 合并后逐段标注：版本切换（与上一段相比适用版本/缺口状态发生变化
+        # 的编号，首段为空）与片段覆盖结论；整体覆盖要求每段每个编号都有
+        # 适用正文。
+        segments: list[dict] = []
+        prev_items: list[dict] | None = None
+        for s, e, items in merged:
+            switches = ([] if prev_items is None else
+                        [item["number"] for item, prev in zip(items, prev_items)
+                         if (item["revision"], item["gap"])
+                         != (prev["revision"], prev["gap"])])
+            segments.append({
+                "start": s, "end": e,
+                "covered": all(item["gap"] is None for item in items),
+                "switches": switches,
+                "items": items})
+            prev_items = items
+
+    return {"numbers": cleaned,
+            "work_start": work_start,
+            "work_end": work_end,
+            "known_as_of": known_as_of,
+            "count": len(segments),
+            "covered": all(seg["covered"] for seg in segments),
+            "segments": segments}
+
+
+def _coverage_item(conn: sqlite3.Connection, entry: dict,
+                   best: sqlite3.Row | None, t: str) -> dict:
+    """一个编号在某片段内的覆盖结果：有效版本（含恢复标记）或缺口。"""
+    if best is None:
+        # 区间外空档：该编号在片段内无适用正文（含知悉时刻下尚未发布）。
+        return {"number": entry["number"], "revision": None, "body": None,
+                "valid_start": None, "valid_end": None,
+                "supersedes_revision": None, "published_at": None,
+                "restored_by_withdrawal": False,
+                "gap": "no_applicable_version"}
+    parent_rev: int | None = None
+    if best["supersedes_id"] is not None:
+        parent = entry["by_id"].get(best["supersedes_id"])
+        parent_rev = (parent["revision"] if parent is not None
+                      # 理论上最深候选的父版本必然可见；兜底从全量版本读取。
+                      else _revision_of(conn, best["supersedes_id"]))
+    # 因撤回导致的恢复：有效版本是被撤回子更正的父版本，且该子更正（撤回
+    # 在知悉时刻前已生效）的适用区间覆盖本片段——若未撤回，本片段适用的
+    # 将是该子更正。
+    restored = any(c["id"] in entry["withdrawn_effective"]
+                   and c["valid_start"] <= t < c["valid_end"]
+                   for c in entry["children"].get(best["id"], []))
+    return {"number": entry["number"], "revision": best["revision"],
+            "body": best["body"], "valid_start": best["valid_start"],
+            "valid_end": best["valid_end"],
+            "supersedes_revision": parent_rev,
+            "published_at": best["published_at"],
+            "restored_by_withdrawal": restored, "gap": None}
 
 
 # ---------------------------------------------------------------- 历史查看

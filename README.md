@@ -44,6 +44,12 @@
   返回前置优先的去重清单及版本，根/引用缺失、无适用正文、引用成环时**保留
   该片段**并标明缺口链或环路径（整体结论为不可用）；相邻片段仅在清单与错误
   状态完全相同时合并，区间外的变动不影响结果。
+- **跨规程版本覆盖检查（只读）**：调度员在安排**跨规程作业**前，输入非空
+  且不重复的规程编号、非空作业区间与知悉时刻；服务在同一只读快照中收集
+  各编号在该知悉时刻可见的适用版本端点，按全体端点切分区间，逐段返回每个
+  编号的有效版本号、正文或缺口，并标出因撤回导致的恢复、区间外空档与版本
+  切换；相邻段仅在整组结果完全相同时合并；编号不存在、时间非法或知悉时刻
+  晚于当前时刻均拒绝。
 
 更正只新增行、不改写任何旧行（append-only）；撤回同样只向 `withdrawals`
 表追加一行事件、从不删除或改写版本行，因此"撤回前知悉时刻的查询结果"天然保持原样。
@@ -761,6 +767,121 @@ curl -sS 'http://localhost:8080/api/v1/audit/events?cursor=0&limit=100'
 | `limit` 非整数或不在 `1..1000` | `422` | `invalid_page_limit`（details 带 `max=1000`） |
 | `limit` 装不下游标后的下一完整批次 | `422` | `page_limit_too_small`（details 带 `batch_seq`/`batch_size`） |
 
+### 12. 跨规程版本覆盖检查 `POST /api/v1/coverage/check`
+
+调度员在安排**跨规程作业**前，检查一组规程编号在整个作业区间内的版本
+覆盖：哪段适用哪个版本、哪里是空档、哪里因撤回而恢复、哪里发生版本切换。
+全程只读、不写任何历史。
+
+```json
+{
+  "numbers": ["SOP-001", "SOP-002"],
+  "work_start": "2026-01-01T00:00:00Z",
+  "work_end":   "2027-01-01T00:00:00Z",
+  "known_as_of": "2026-05-01T00:00:00Z"
+}
+```
+
+- `numbers` 非空、不得重复；响应保留调用方传入的编号顺序。
+- `work_start`/`work_end` 为非空半开作业区间 `[起, 止)`；
+  `known_as_of` 不得晚于服务端当前时刻。
+
+语义：
+
+- **同一只读快照**：端点收集、切分与逐片段解析全部在一次读取快照内完成，
+  不拼接并发写入的中间结果；全程只读、**不改变历史**。
+- **按全体端点切分**：取各编号在该知悉时刻已发布（`published_at <= k`）
+  的全部版本之适用区间端点——可见版本的端点是版本切换边界，撤回已生效
+  版本的端点标出"因撤回恢复"的边界——与作业区间求交后排序，切成首尾
+  相接、互不重叠、恰好覆盖全区间的左闭右开片段；区间外的端点被裁剪、
+  不产生片段。
+- **逐片段结果**：每片段按输入顺序给出每个编号的有效版本（`revision`、
+  `body`、`valid_start`/`valid_end`、`supersedes_revision`、
+  `published_at`）或缺口（无适用正文时版本字段全为 `null`、
+  `gap = "no_applicable_version"`，即区间外空档，含该知悉时刻下尚未
+  发布）；并带：
+  - `restored_by_withdrawal`：该片段的有效版本之所以适用，是因为覆盖
+    它的子更正在知悉时刻前已撤回、区间恢复由父版本持有（因撤回导致的
+    恢复）；
+  - `covered`：该片段内每个编号都有适用正文；
+  - `switches`：与上一片段相比适用版本（含缺口状态）发生切换的编号
+    （首段为空列表；仅恢复标记变化的边界不算版本切换）。
+- **合并规则**：相邻片段仅在整组结果（全部编号的版本/正文/区间/恢复
+  标记/缺口）**完全相同**时才合并；被中间状态隔开的相同片段不跨段合并。
+- 顶层 `covered` 仅在全部片段均覆盖时为 `true`。
+
+响应示例（SOP-001 全年适用、其 3 月更正已撤回；SOP-002 仅 3 月适用）：
+
+```json
+{
+  "numbers": ["SOP-001", "SOP-002"],
+  "work_start": "2026-01-01T00:00:00.000000Z",
+  "work_end":   "2027-01-01T00:00:00.000000Z",
+  "known_as_of": "2026-05-01T00:00:00.000000Z",
+  "count": 3,
+  "covered": false,
+  "segments": [
+    {"start": "2026-01-01T00:00:00.000000Z", "end": "2026-03-01T00:00:00.000000Z",
+     "covered": false, "switches": [],
+     "items": [
+       {"number": "SOP-001", "revision": 0, "body": "初版正文：……",
+        "valid_start": "2026-01-01T00:00:00.000000Z",
+        "valid_end":   "2027-01-01T00:00:00.000000Z",
+        "supersedes_revision": null,
+        "published_at": "2026-02-10T03:12:44.918203Z",
+        "restored_by_withdrawal": false, "gap": null},
+       {"number": "SOP-002", "revision": null, "body": null,
+        "valid_start": null, "valid_end": null,
+        "supersedes_revision": null, "published_at": null,
+        "restored_by_withdrawal": false, "gap": "no_applicable_version"}]},
+    {"start": "2026-03-01T00:00:00.000000Z", "end": "2026-04-01T00:00:00.000000Z",
+     "covered": true, "switches": ["SOP-002"],
+     "items": [
+       {"number": "SOP-001", "revision": 0, "body": "初版正文：……",
+        "valid_start": "2026-01-01T00:00:00.000000Z",
+        "valid_end":   "2027-01-01T00:00:00.000000Z",
+        "supersedes_revision": null,
+        "published_at": "2026-02-10T03:12:44.918203Z",
+        "restored_by_withdrawal": true, "gap": null},
+       {"number": "SOP-002", "revision": 0, "body": "三月版正文：……",
+        "valid_start": "2026-03-01T00:00:00.000000Z",
+        "valid_end":   "2026-04-01T00:00:00.000000Z",
+        "supersedes_revision": null,
+        "published_at": "2026-02-11T08:00:00.000000Z",
+        "restored_by_withdrawal": false, "gap": null}]},
+    {"start": "2026-04-01T00:00:00.000000Z", "end": "2027-01-01T00:00:00.000000Z",
+     "covered": false, "switches": ["SOP-002"],
+     "items": [
+       {"number": "SOP-001", "revision": 0, "body": "初版正文：……",
+        "valid_start": "2026-01-01T00:00:00.000000Z",
+        "valid_end":   "2027-01-01T00:00:00.000000Z",
+        "supersedes_revision": null,
+        "published_at": "2026-02-10T03:12:44.918203Z",
+        "restored_by_withdrawal": false, "gap": null},
+       {"number": "SOP-002", "revision": null, "body": null,
+        "valid_start": null, "valid_end": null,
+        "supersedes_revision": null, "published_at": null,
+        "restored_by_withdrawal": false, "gap": "no_applicable_version"}]}
+  ]
+}
+```
+
+> 首尾两段的整组结果完全相同（SOP-001 r0 未恢复 + SOP-002 空档），但
+> 被 3 月片段隔开，故不跨段合并；3 月片段内 SOP-001 的
+> `restored_by_withdrawal=true` 标出"撤回后恢复父版本"的区间。
+
+拒绝情况（均只读、不写历史）：
+
+| 情况 | 状态码 | error.code |
+| --- | --- | --- |
+| 编号在列表中重复 | `422` | `duplicate_coverage_number`（details 带 `index`/`number`） |
+| 编号为空白串 | `422` | `invalid_number`（details 带 `index`） |
+| 某编号不存在 | `404` | `procedure_not_found`（details 带 `index`/`number`） |
+| `work_start >= work_end`（空/倒置作业区间） | `422` | `invalid_interval` |
+| 任一时刻缺时区 / 不可解析 | `422` | `invalid_time` |
+| 知悉时刻晚于服务端当前时刻 | `422` | `known_as_of_in_future` |
+| `numbers` 为空/缺失、缺少区间或知悉时刻、出现额外字段 | `422` | `validation_error` |
+
 ---
 
 ## 四、调用示例
@@ -789,7 +910,11 @@ curl -sS 'http://localhost:8080/api/v1/audit/events?cursor=0&limit=100'
 **值班审计变动日志（首次发布/批量更正/撤回逐事件按提交顺序增量拉取、批量
 同请求顺序不跨页、游标只随已提交事务前进、并发与翻页不重现不遗漏、空页游标
 不变、升级前版本与撤回一次性回填为单事件且不改写原记录、非法游标与上限装
-不下整批明确报错）**。
+不下整批明确报错）**→
+**跨规程版本覆盖检查（按全体端点切分作业区间、逐段返回每个编号有效版本/
+正文或缺口、撤回恢复与区间外空档与版本切换标记、相同相邻段合并而相同但
+不相邻不合并、区间外变动不切分、编号重复/不存在/未来知悉时刻/空区间/
+缺时区等拒绝且只读不写历史）**。
 
 ---
 
@@ -854,6 +979,15 @@ curl -sS 'http://localhost:8080/api/v1/audit/events?cursor=0&limit=100'
   `page_limit_too_small` 且游标不前进；空页游标原样返回。服务启动时对
   升级前 `versions`/`withdrawals` 做一次幂等回填，逐条生成单事件批次
   （按服务端时刻、发布先于撤回的次序），只追加审计表、不改写任何原记录。
+- **跨规程覆盖即逐片段版本状态**：`coverage/check` 在同一只读快照内取
+  各编号在知悉时刻已发布的全部版本端点（可见版本的端点给出版本切换边界，
+  撤回已生效版本的端点给出恢复区间边界）切分作业区间，逐片段以片段起点
+  为代表作业时刻、按与回溯查询完全一致的可见性与"沿替代链取最深"规则求
+  每个编号的有效版本；`restored_by_withdrawal` 当且仅当有效版本是被撤回
+  子更正的父版本且该子更正（撤回在知悉时刻前已生效）覆盖本片段；
+  `switches` 只标适用版本（含缺口状态）发生切换的编号，仅恢复标记变化
+  的边界不算版本切换；相邻片段仅在整组结果完全相同时合并。全程只读，
+  编号不存在/时间非法/未来知悉时刻直接拒绝、不写历史。
 - **时间存储**：统一存为定长 UTC 字符串，字典序与时间序一致，区间过滤直接用
   字符串比较；WAL 模式下读写不互斥。
 
@@ -864,7 +998,7 @@ pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-共 162 个用例，覆盖双时间维可见性边界（含微秒）、时区偏移规范化、更正仅覆盖
+共 188 个用例，覆盖双时间维可见性边界（含微秒）、时区偏移规范化、更正仅覆盖
 子区间、链式更正、四类整体拒绝、批量原子回滚、两知悉时刻区间对比、**更正撤回
 （撤回后恢复父版本正文、撤回前知悉时刻历史不变、撤回时刻边界、首版/重复撤回/
 已有子更正/以撤回版本为基版等拒绝、撤回后再次更正、撤回与并发撤回的确定性
@@ -887,7 +1021,12 @@ python -m unittest discover -s tests -v
 （发布/更正/撤回事件按提交顺序读取、批量同请求顺序成批且不跨页、page_limit
 装不下整批报错且游标不前进、空页游标不变、非法游标/上限报错、整批回滚不留
 审计行、翻页期间并发写入不重现不遗漏、升级前版本与撤回一次性回填为单事件且
-幂等不改写原记录、升级后新事务追加在回填批次之后）及完整 HTTP 流程。
+幂等不改写原记录、升级后新事务追加在回填批次之后）、**跨规程版本覆盖检查
+（全体端点切分且片段覆盖全区间互不重叠、逐段每编号有效版本/正文或缺口、
+撤回恢复标记与恢复边界不切并不合并、区间外空档与 covered 结论、版本切换
+switches、相同但不相邻片段不跨段合并、区间端点裁剪、区间外变动不切分、
+知悉时刻后发布的版本不产生端点、编号重复/空白/不存在/未来知悉时刻/空区间/
+缺时区拒绝且只读不写历史）**及完整 HTTP 流程。
 
 > 本机未安装 fastapi/httpx 时，HTTP 用例自动跳过（服务层用例不受影响）；
 > Docker 镜像与 CI 安装 `requirements-dev.txt` 后全部运行。
@@ -901,7 +1040,8 @@ python -m unittest discover -s tests -v
 │   ├── service.py       # 领域服务：发布 / 更正 / 更正批量预演（只读快照副本）/
 │   │                    #   撤回 / 回溯 / 对比 / 规程包 /
 │   │                    #   前置规程递归解析（单时刻闭包 / 跨时段逐片段可用性）/
-│   │                    #   值班审计变动日志（游标增量、批次原子分页）
+│   │                    #   值班审计变动日志（游标增量、批次原子分页）/
+│   │                    #   跨规程版本覆盖检查（逐片段有效版本/缺口）
 │   ├── db.py            # SQLite 连接、建表（含 withdrawals、packages、
 │   │                    #   prerequisites、audit_batches/audit_events 等）、
 │   │                    #   升级前历史的审计回填、写事务与只读快照事务
