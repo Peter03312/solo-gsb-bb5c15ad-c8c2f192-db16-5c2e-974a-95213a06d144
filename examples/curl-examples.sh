@@ -653,3 +653,104 @@ curl -sS -i "$BASE_URL/api/v1/audit/events?cursor=99999999"; echo
 # --- 41b. 非法上限（0 / 超过 1000） -> 422 invalid_page_limit ---------------
 curl -sS -i "$BASE_URL/api/v1/audit/events?limit=0"; echo
 curl -sS -i "$BASE_URL/api/v1/audit/events?limit=1001"; echo
+
+# ------------------------------------------------------------------------
+# 跨规程版本覆盖检查（本轮新增）：调度员安排跨规程作业前，输入非空且不重
+# 复的规程编号、非空作业区间与知悉时刻；服务在同一只读快照内按全体编号
+# 的版本端点切分作业区间，逐段返回每个编号的有效版本号、正文或缺口，并
+# 标出因撤回导致的恢复、区间外空档与版本切换。全程只读、不写历史。
+# ------------------------------------------------------------------------
+
+# --- 42. 准备：两个规程全年适用；SOP-COV-001 在 3 月有更正 ----------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-COV-001",
+        "body": "初版正文：动火作业须办理动火票。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-COV-001",
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "更正正文：3 月检修期动火须双人监护。"
+      }'; echo
+# 知悉时刻取最后一笔写入的服务端发布时刻（此前提交全部可见）
+KNOWN=$(curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-COV-002",
+        "body": "初版正文：进入装置区必须佩戴安全帽。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["published_at"])')
+
+# --- 43. 覆盖检查：全体端点切分为 3 段，3 月段标出版本切换 ----------------
+curl -sS -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-002\"],
+        \"work_start\": \"2026-01-01T00:00:00Z\",
+        \"work_end\":   \"2027-01-01T00:00:00Z\",
+        \"known_as_of\": \"$KNOWN\"
+      }"; echo
+
+# --- 44. 撤回 3 月更正后再查：3 月段恢复父版本并标 restored_by_withdrawal -
+#       （知悉时刻取撤回之后的当前时刻；边界含等号，恰好等于撤回时刻时
+#       被撤回版本仍可见）
+curl -sS -X POST "$BASE_URL/api/v1/withdrawals" \
+  -H 'Content-Type: application/json' \
+  -d '{ "number": "SOP-COV-001", "revision": 1 }'; echo
+KNOWN2=$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)
+curl -sS -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-002\"],
+        \"work_start\": \"2026-01-01T00:00:00Z\",
+        \"work_end\":   \"2027-01-01T00:00:00Z\",
+        \"known_as_of\": \"$KNOWN2\"
+      }"; echo
+
+# --- 45a. 编号重复 -> 422 duplicate_coverage_number（只读、不写历史） -----
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-001\"],
+        \"work_start\": \"2026-01-01T00:00:00Z\",
+        \"work_end\":   \"2027-01-01T00:00:00Z\",
+        \"known_as_of\": \"$KNOWN2\"
+      }"; echo
+
+# --- 45b. 编号不存在 -> 404 procedure_not_found ---------------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\", \"SOP-COV-NOPE\"],
+        \"work_start\": \"2026-01-01T00:00:00Z\",
+        \"work_end\":   \"2027-01-01T00:00:00Z\",
+        \"known_as_of\": \"$KNOWN2\"
+      }"; echo
+
+# --- 45c. 知悉时刻晚于服务端当前时刻 -> 422 known_as_of_in_future ---------
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "numbers": ["SOP-COV-001"],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end":   "2027-01-01T00:00:00Z",
+        "known_as_of": "2999-01-01T00:00:00Z"
+      }'; echo
+
+# --- 45d. 空作业区间（起=止） -> 422 invalid_interval ---------------------
+curl -sS -i -X POST "$BASE_URL/api/v1/coverage/check" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"numbers\": [\"SOP-COV-001\"],
+        \"work_start\": \"2026-03-01T00:00:00Z\",
+        \"work_end\":   \"2026-03-01T00:00:00Z\",
+        \"known_as_of\": \"$KNOWN2\"
+      }"; echo

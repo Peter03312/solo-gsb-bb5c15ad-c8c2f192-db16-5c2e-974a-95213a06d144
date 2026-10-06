@@ -1572,6 +1572,257 @@ class ClosurePlanTests(unittest.TestCase):
         self.assertEqual(service.list_history("PL-E3"), before)
 
 
+class CoverageCheckTests(unittest.TestCase):
+    """跨规程版本覆盖检查：逐段返回各编号有效版本/缺口与切换、恢复标记。"""
+
+    def setUp(self):
+        reset_db()
+
+    def _now(self) -> str:
+        # 服务端发布时钟单调递增；略作停顿确保知悉时刻不晚于当前时刻
+        import time as _time
+        _time.sleep(0.002)
+        return now_canonical()
+
+    def _check(self, numbers, start=t1, end=t5, known=None):
+        return service.check_coverage(numbers, start, end,
+                                      known or self._now())
+
+    # ---- 基本切分与标记 --------------------------------------------------
+
+    def test_single_constant_coverage(self):
+        release("C-1", body="唯一版本")
+        res = self._check(["C-1"])
+        self.assertEqual(res["count"], 1)
+        self.assertTrue(res["fully_covered"])
+        self.assertEqual(res["numbers"], ["C-1"])
+        self.assertEqual(res["work_start"], canon(t1))
+        self.assertEqual(res["work_end"], canon(t5))
+        self.assertEqual(res["known_as_of"], canon(res["known_as_of"]))
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t1), canon(t5)))
+        self.assertFalse(seg["version_switch"])
+        self.assertFalse(seg["has_gap"])
+        self.assertFalse(seg["restored"])
+        it = seg["items"][0]
+        self.assertEqual(it["number"], "C-1")
+        self.assertEqual(it["revision"], 0)
+        self.assertEqual(it["body"], "唯一版本")
+        self.assertEqual(it["valid_start"], canon(t1))
+        self.assertEqual(it["valid_end"], canon(t5))
+        self.assertIsNone(it["supersedes_revision"])
+        self.assertTrue(it["published_at"].endswith("Z"))
+        self.assertFalse(it["gap"])
+        self.assertFalse(it["restored_by_withdrawal"])
+        self.assertFalse(it["switched"])
+
+    def test_union_of_endpoints_splits_and_marks_switches(self):
+        release("C-A", body="A0")
+        correct("C-A", 0, t2, t3, "A1")          # A 在 3 月切换
+        release("C-B", body="B0")
+        correct("C-B", 0, t3, t4, "B1")          # B 在 4-5 月切换
+        res = self._check(["C-A", "C-B"])
+        self.assertTrue(res["fully_covered"])
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t1), canon(t2)), (canon(t2), canon(t3)),
+                          (canon(t3), canon(t4)), (canon(t4), canon(t5))])
+        self.assertEqual(
+            [[(i["number"], i["revision"]) for i in s["items"]]
+             for s in res["segments"]],
+            [[("C-A", 0), ("C-B", 0)], [("C-A", 1), ("C-B", 0)],
+             [("C-A", 0), ("C-B", 1)], [("C-A", 0), ("C-B", 0)]])
+        # 版本切换：首段 False，其后每段相对前一段整组均有变化
+        self.assertEqual([s["version_switch"] for s in res["segments"]],
+                         [False, True, True, True])
+        # 逐项 switched 只标实际切换的编号
+        self.assertEqual(
+            [[i["switched"] for i in s["items"]] for s in res["segments"]],
+            [[False, False], [True, False], [True, True], [False, True]])
+        self.assertEqual(res["segments"][1]["items"][0]["body"], "A1")
+        self.assertEqual(
+            res["segments"][1]["items"][0]["supersedes_revision"], 0)
+
+    def test_numbers_order_preserved(self):
+        release("C-Z", body="Z")
+        release("C-Y", body="Y")
+        res = self._check(["C-Z", "C-Y"])
+        self.assertEqual(res["numbers"], ["C-Z", "C-Y"])
+        self.assertEqual([i["number"] for i in res["segments"][0]["items"]],
+                         ["C-Z", "C-Y"])
+
+    def test_window_clipped_and_outside_versions_ignored(self):
+        release("C-O", body="O0")
+        correct("C-O", 0, t2, t4, "O1")
+        # 作业区间只问 [t3, t5)：端点裁剪到区间
+        res = self._check(["C-O"], start=t3, end=t5)
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t3), canon(t4)), (canon(t4), canon(t5))])
+        self.assertEqual([s["items"][0]["revision"] for s in res["segments"]],
+                         [1, 0])
+        # 完全落在作业区间之外的版本不产生端点
+        far = iso(_T + timedelta(days=400))
+        release("C-OUT", body="x", start=t1, end=far)
+        correct("C-OUT", 0, t5, far, "区间外更正")
+        res = self._check(["C-OUT"], start=t1, end=t5)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["items"][0]["revision"], 0)
+
+    # ---- 缺口（区间外空档） ------------------------------------------------
+
+    def test_gap_segments_for_uncovered_intervals(self):
+        release("C-G", body="仅三月", start=t2, end=t3)
+        res = self._check(["C-G"])
+        self.assertFalse(res["fully_covered"])
+        self.assertEqual(res["count"], 3)
+        self.assertEqual([s["has_gap"] for s in res["segments"]],
+                         [True, False, True])
+        gap_item = res["segments"][0]["items"][0]
+        self.assertTrue(gap_item["gap"])
+        self.assertIsNone(gap_item["revision"])
+        self.assertIsNone(gap_item["body"])
+        self.assertIsNone(gap_item["published_at"])
+        self.assertFalse(gap_item["restored_by_withdrawal"])
+        self.assertEqual(res["segments"][1]["items"][0]["revision"], 0)
+        # 两端同为缺口但不相邻 -> 不跨段合并
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t1), canon(t2)), (canon(t2), canon(t3)),
+                          (canon(t3), canon(t5))])
+
+    def test_known_as_of_before_publish_yields_gaps(self):
+        release("C-N", body="x")
+        res = self._check(["C-N"], known=t0)
+        self.assertEqual(res["count"], 1)
+        self.assertFalse(res["fully_covered"])
+        self.assertTrue(res["segments"][0]["items"][0]["gap"])
+
+    def test_unpublished_correction_does_not_split(self):
+        pub0 = release("C-U", body="初版")["published_at"]
+        correct("C-U", 0, t2, t3, "尚不知悉的更正")
+        # 知悉时刻取 r0 发布时刻：r1 尚未发布，不产生端点
+        res = self._check(["C-U"], known=pub0)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["items"][0]["revision"], 0)
+
+    # ---- 撤回恢复 ----------------------------------------------------------
+
+    def test_withdrawal_restoration_marked_and_not_merged(self):
+        release("C-W", body="父版本")
+        correct("C-W", 0, t2, t3, "误发更正")
+        withdraw("C-W", 1)
+        res = self._check(["C-W"])
+        # 已撤回版本的端点把"恢复父版本"区间精确圈出；两侧同为 r0 但恢复
+        # 标记不同 -> 整组结果不同、不合并
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t1), canon(t2)), (canon(t2), canon(t3)),
+                          (canon(t3), canon(t5))])
+        self.assertEqual([s["items"][0]["revision"] for s in res["segments"]],
+                         [0, 0, 0])
+        self.assertEqual([s["items"][0]["restored_by_withdrawal"]
+                          for s in res["segments"]], [False, True, False])
+        self.assertEqual([s["restored"] for s in res["segments"]],
+                         [False, True, False])
+        self.assertTrue(res["fully_covered"])
+
+    def test_restoration_not_marked_before_withdrawal(self):
+        release("C-WB", body="父版本")
+        correct("C-WB", 0, t2, t3, "更正")
+        pub1 = service.list_history("C-WB")["items"][1]["published_at"]
+        withdraw("C-WB", 1)
+        # 知悉时刻取更正发布时刻（撤回尚未发生）：看到更正版本、无恢复标记
+        res = self._check(["C-WB"], known=pub1)
+        self.assertEqual([s["items"][0]["revision"] for s in res["segments"]],
+                         [0, 1, 0])
+        self.assertFalse(any(s["restored"] for s in res["segments"]))
+
+    def test_adjacent_identical_groups_merge(self):
+        # 两段相邻的"撤回恢复"区间（r1、r2 先后发布又先后撤回）合并为一段
+        release("C-M", body="父版本")
+        correct("C-M", 0, t2, t3, "误发一")
+        withdraw("C-M", 1)
+        correct("C-M", 0, t3, t4, "误发二")
+        withdraw("C-M", 2)
+        res = self._check(["C-M"])
+        self.assertEqual(
+            [(s["start"], s["end"], s["items"][0]["restored_by_withdrawal"])
+             for s in res["segments"]],
+            [(canon(t1), canon(t2), False),
+             (canon(t2), canon(t4), True),
+             (canon(t4), canon(t5), False)])
+
+    def test_recorrection_after_withdrawal_clears_restored_flag(self):
+        # 撤回后在恢复区间再次更正：新更正覆盖处不再是"恢复"
+        release("C-RC", body="父版本")
+        correct("C-RC", 0, t2, t3, "误发")
+        withdraw("C-RC", 1)
+        correct("C-RC", 0, t2, t3, "重新发布的更正")
+        res = self._check(["C-RC"])
+        self.assertEqual([s["items"][0]["revision"] for s in res["segments"]],
+                         [0, 2, 0])
+        self.assertFalse(any(s["restored"] for s in res["segments"]))
+
+    # ---- 拒绝情形（均只读、不写历史） --------------------------------------
+
+    def test_empty_numbers_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            service.check_coverage([], t1, t5, self._now())
+        self.assertEqual(ctx.exception.code, "validation_error")
+        self.assertEqual(ctx.exception.http_status, 422)
+
+    def test_duplicate_numbers_rejected(self):
+        release("C-D")
+        with self.assertRaises(DomainError) as ctx:
+            self._check(["C-D", "C-D"])
+        self.assertEqual(ctx.exception.code, "duplicate_coverage_number")
+        self.assertEqual(ctx.exception.http_status, 422)
+        self.assertEqual(ctx.exception.details, {"number": "C-D", "index": 1})
+
+    def test_blank_number_rejected(self):
+        with self.assertRaises(DomainError) as ctx:
+            self._check(["   "])
+        self.assertEqual(ctx.exception.code, "invalid_number")
+
+    def test_unknown_number_rejected_404(self):
+        release("C-K")
+        with self.assertRaises(DomainError) as ctx:
+            self._check(["C-K", "C-NOPE"])
+        self.assertEqual(ctx.exception.code, "procedure_not_found")
+        self.assertEqual(ctx.exception.http_status, 404)
+        self.assertEqual(ctx.exception.details,
+                         {"number": "C-NOPE", "index": 1})
+
+    def test_invalid_times_rejected(self):
+        release("C-T")
+        with self.assertRaises(DomainError) as ctx:
+            self._check(["C-T"], start="2026-01-01T00:00:00")
+        self.assertEqual(ctx.exception.code, "invalid_time")
+        self.assertEqual(ctx.exception.details["field"], "work_start")
+        with self.assertRaises(DomainError) as ctx:
+            self._check(["C-T"], start=t3, end=t2)
+        self.assertEqual(ctx.exception.code, "invalid_interval")
+        with self.assertRaises(DomainError) as ctx:
+            self._check(["C-T"], known="2026-01-01T00:00:00")
+        self.assertEqual(ctx.exception.code, "invalid_time")
+        self.assertEqual(ctx.exception.details["field"], "known_as_of")
+
+    def test_known_as_of_in_future_rejected(self):
+        release("C-F")
+        with self.assertRaises(DomainError) as ctx:
+            self._check(["C-F"], known=future)
+        self.assertEqual(ctx.exception.code, "known_as_of_in_future")
+        self.assertEqual(ctx.exception.http_status, 422)
+
+    def test_read_only_does_not_change_history(self):
+        release("C-R", body="初版")
+        correct("C-R", 0, t2, t3, "更正")
+        withdraw("C-R", 1)
+        before = service.list_history("C-R")
+        feed_before = service.read_change_feed(None, None)
+        self._check(["C-R"])
+        self._check(["C-R"], known=t0)
+        self.assertEqual(service.list_history("C-R"), before)
+        self.assertEqual(service.read_change_feed(None, None), feed_before)
+
+
 def pitem(number: str, base: int, start: str, end: str, body: str = "预演更正",
           prerequisites=None):
     return item(number, body, start, end, base, prerequisites=prerequisites)
@@ -2267,7 +2518,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.json()["error"]["code"],
                          "duplicate_prerequisite_number")
         r = c.post("/api/v1/releases", json={
-            "number": self._n(), "body": "旧式", "valid_start": t1,
+            "number": self._n() + "-OLD", "body": "旧式", "valid_start": t1,
             "valid_end": t5})
         self.assertEqual(r.status_code, 201)
         self.assertEqual(r.json()["items"][0]["prerequisites"], [])
@@ -2523,6 +2774,96 @@ class ApiTests(unittest.TestCase):
                          .json()["count"], 2)
         self.assertEqual(c.get(f"/api/v1/procedures/{n}/history")
                          .json()["items"][-1]["revision"], 1)
+
+    def test_coverage_check_over_http(self):
+        c = self.client
+        n1, n2 = self._n() + "-1", self._n() + "-2"
+        c.post("/api/v1/releases", json={
+            "number": n1, "body": "A0", "valid_start": t1, "valid_end": t5})
+        c.post("/api/v1/corrections", json={
+            "number": n1, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "A1"})
+        # 知悉时刻取最后一笔写入的服务端发布时刻：此前提交全部可见
+        pub = c.post("/api/v1/releases", json={
+            "number": n2, "body": "B0", "valid_start": t1,
+            "valid_end": t5}).json()["published_at"]
+
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1, n2], "work_start": t1, "work_end": t5,
+            "known_as_of": pub})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["numbers"], [n1, n2])
+        self.assertTrue(body["fully_covered"])
+        self.assertEqual(body["count"], 3)
+        self.assertEqual([s["start"] for s in body["segments"]],
+                         [canon(t1), canon(t2), canon(t3)])
+        self.assertEqual(
+            [[i["revision"] for i in s["items"]] for s in body["segments"]],
+            [[0, 0], [1, 0], [0, 0]])
+        self.assertEqual([s["version_switch"] for s in body["segments"]],
+                         [False, True, True])
+        self.assertEqual(body["segments"][1]["items"][0]["body"], "A1")
+
+        # 编号重复 -> 422 duplicate_coverage_number
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1, n1], "work_start": t1, "work_end": t5,
+            "known_as_of": pub})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"],
+                         "duplicate_coverage_number")
+
+        # 编号不存在 -> 404 procedure_not_found
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": ["NO-SUCH"], "work_start": t1, "work_end": t5,
+            "known_as_of": pub})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "procedure_not_found")
+
+        # 空编号列表 / 缺 known_as_of / 额外字段 -> 422 validation_error
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [], "work_start": t1, "work_end": t5,
+            "known_as_of": pub})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1], "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1], "work_start": t1, "work_end": t5,
+            "known_as_of": pub, "created_at": pub})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
+
+        # 知悉时刻晚于服务端当前时刻 -> 422 known_as_of_in_future
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1], "work_start": t1, "work_end": t5,
+            "known_as_of": future})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "known_as_of_in_future")
+
+        # 空作业区间 -> 422 invalid_interval；缺时区 -> 422 invalid_time
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1], "work_start": t2, "work_end": t2,
+            "known_as_of": pub})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1], "work_start": "2026-01-01T00:00:00",
+            "work_end": t5, "known_as_of": pub})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_time")
+
+        # 全程只读：两次调用后历史不变（仍 r0/r1 两个版本 + n2 的 r0）
+        r = c.post("/api/v1/coverage/check", json={
+            "numbers": [n1, n2], "work_start": t1, "work_end": t5,
+            "known_as_of": pub})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(c.get(f"/api/v1/procedures/{n1}/history")
+                         .json()["count"], 2)
+        self.assertEqual(c.get(f"/api/v1/procedures/{n2}/history")
+                         .json()["count"], 1)
 
     def test_audit_feed_over_http(self):
         c = self.client

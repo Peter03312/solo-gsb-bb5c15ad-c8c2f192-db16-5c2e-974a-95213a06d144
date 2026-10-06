@@ -240,6 +240,23 @@ def prerequisite_cycle(cycle: list[str]) -> DomainError:
         http_status=409, details={"cycle": cycle})
 
 
+# ---------------------------------------------------------------- 跨规程版本覆盖检查
+
+
+def duplicate_coverage_number(number: str, at_index: int) -> DomainError:
+    return DomainError(
+        "duplicate_coverage_number",
+        f"规程编号 {number} 在覆盖检查请求中重复出现，编号列表必须互不相同",
+        http_status=422, details={"number": number, "index": at_index})
+
+
+def coverage_procedure_not_found(number: str, at_index: int) -> DomainError:
+    return DomainError(
+        "procedure_not_found",
+        f"规程编号 {number} 不存在，无法进行版本覆盖检查",
+        http_status=404, details={"number": number, "index": at_index})
+
+
 # ---------------------------------------------------------------- 值班审计变动日志
 
 

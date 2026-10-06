@@ -134,6 +134,93 @@ def main() -> None:
     # 15) 值班审计变动日志：游标增量拉取（从起始游标读到尾）
     _audit_feed_examples()
 
+    # 16) 跨规程版本覆盖检查（本轮新增）：调度员安排跨规程作业前核对版本覆盖
+    _coverage_examples()
+
+
+def _coverage_examples() -> None:
+    """跨规程版本覆盖检查：逐段返回各编号有效版本/缺口与切换、恢复标记。"""
+    na, nb = "SOP-DEMO-COV-1", "SOP-DEMO-COV-2"
+
+    # 16.1) 准备：两个规程全年适用；COV-1 在 3 月有一条更正
+    call("POST", "/api/v1/releases", {
+        "number": na, "body": "初版正文：动火作业须办理动火票。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z"})
+    call("POST", "/api/v1/corrections", {
+        "number": na, "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "更正正文：3 月检修期动火须双人监护。"})
+    # 知悉时刻取最后一笔写入的服务端发布时刻（此前提交全部可见）
+    _, res = call("POST", "/api/v1/releases", {
+        "number": nb, "body": "初版正文：进入装置区必须佩戴安全帽。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z"})
+    known = res["published_at"]
+
+    # 16.2) 覆盖检查：全体端点把全年切成 3 段，3 月段 COV-1 切到 r1，
+    #       逐项 switched 与片段 version_switch 标出版本切换
+    status, res = call("POST", "/api/v1/coverage/check", {
+        "numbers": [na, nb],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "known_as_of": known})
+    show("16.2 覆盖检查（3 段，3 月段标版本切换）", status, res)
+
+    # 16.3) 撤回 3 月更正后再查：3 月段恢复父版本 r0，
+    #       标 restored_by_withdrawal（恢复边界不算版本切换）。
+    #       知悉时刻取撤回之后的当前时刻（边界含等号：恰好等于撤回时刻时
+    #       被撤回版本仍可见）。
+    call("POST", "/api/v1/withdrawals", {"number": na, "revision": 1})
+    from datetime import datetime, timezone
+    known2 = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    status, res = call("POST", "/api/v1/coverage/check", {
+        "numbers": [na, nb],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "known_as_of": known2})
+    show("16.3 撤回后再查（恢复片段标 restored_by_withdrawal）", status, res)
+
+    # 16.4) 区间外空档：COV-3 只覆盖上半年，下半年片段 gap=true、
+    #       片段 has_gap=true、顶层 fully_covered=false
+    _, res = call("POST", "/api/v1/releases", {
+        "number": "SOP-DEMO-COV-3", "body": "仅上半年有效的临时规程。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2026-07-01T00:00:00Z"})
+    status, res = call("POST", "/api/v1/coverage/check", {
+        "numbers": ["SOP-DEMO-COV-3"],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "known_as_of": res["published_at"]})
+    show("16.4 区间外空档（下半年 gap，fully_covered=false）", status, res)
+
+    # 16.5) 拒绝情形（均只读、不写历史）
+    status, res = call("POST", "/api/v1/coverage/check", {
+        "numbers": [na, na],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "known_as_of": known2})
+    show("16.5a 编号重复 -> 422 duplicate_coverage_number", status, res)
+    status, res = call("POST", "/api/v1/coverage/check", {
+        "numbers": [na, "SOP-DEMO-COV-NOPE"],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "known_as_of": known2})
+    show("16.5b 编号不存在 -> 404 procedure_not_found", status, res)
+    status, res = call("POST", "/api/v1/coverage/check", {
+        "numbers": [na],
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+        "known_as_of": "2999-01-01T00:00:00Z"})
+    show("16.5c 知悉时刻晚于当前 -> 422 known_as_of_in_future", status, res)
+    status, res = call("POST", "/api/v1/coverage/check", {
+        "numbers": [na],
+        "work_start": "2026-03-01T00:00:00Z",
+        "work_end": "2026-03-01T00:00:00Z",
+        "known_as_of": known2})
+    show("16.5d 空作业区间 -> 422 invalid_interval", status, res)
+
 
 def _audit_feed_examples() -> None:
     """值班审计变动日志：按提交顺序游标分页，批次不跨页。"""

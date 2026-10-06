@@ -11,9 +11,9 @@ from .config import settings
 from .db import init_db
 from .errors import DomainError
 from .schemas import (CorrectionBatch, CorrectionItem, CorrectionPreviewBatch,
-                      CorrectionPreviewItem, PackageRequest,
-                      ReleaseBatch, ReleaseItem, WithdrawalBatch,
-                      WithdrawalItem)
+                      CorrectionPreviewItem, CoverageCheckRequest,
+                      PackageRequest, ReleaseBatch, ReleaseItem,
+                      WithdrawalBatch, WithdrawalItem)
 
 app = FastAPI(
     title="安全作业规程历史回溯服务",
@@ -21,8 +21,9 @@ app = FastAPI(
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核、前置规程"
-                 "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性），"
-                 "以及多条更正正式提交前的只读批量预演（不写历史、不占版本号）。"),
+                 "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）、"
+                 "多条更正正式提交前的只读批量预演（不写历史、不占版本号），"
+                 "以及调度员安排跨规程作业前的版本覆盖检查（逐段整组状态）。"),
 )
 
 
@@ -72,6 +73,7 @@ def index() -> dict:
                 "GET  /api/v1/procedures/{number}/diff",
                 "GET  /api/v1/procedures/{number}/closure",
                 "GET  /api/v1/procedures/{number}/closure-plan",
+                "POST /api/v1/coverage/check",
                 "GET  /api/v1/audit/events",
             ]}
 
@@ -229,6 +231,21 @@ def review_package(package_id: str, known_as_of: str) -> dict:
     缺时区）-> 422。
     """
     return service.review_package(package_id, known_as_of)
+
+
+@app.post("/api/v1/coverage/check", status_code=200)
+def coverage_check(req: CoverageCheckRequest) -> dict:
+    """跨规程版本覆盖检查：调度员安排跨规程作业前核对版本覆盖。
+
+    输入非空且不重复的规程编号、非空作业区间 [work_start, work_end) 与
+    知悉时刻（不得晚于服务端当前时刻）；在同一只读快照内按全体编号的
+    版本端点切分作业区间，逐段返回每个编号的有效版本号、正文或缺口，
+    并标出因撤回导致的恢复、区间外空档与版本切换；相邻段仅在整组结果
+    完全相同时合并。编号不存在 -> 404；时间非法、编号重复、知悉时刻
+    晚于当前时刻 -> 422。全程只读、不写历史。
+    """
+    return service.check_coverage(req.numbers, req.work_start, req.work_end,
+                                  req.known_as_of)
 
 
 @app.get("/api/v1/audit/events")

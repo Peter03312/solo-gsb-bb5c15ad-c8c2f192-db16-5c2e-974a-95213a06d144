@@ -81,6 +81,13 @@
 - 预演**全程只读**：不写版本、不占版本号、不推进服务端时钟、不改变历史
   （连正式提交与预演共用的应用逻辑也跑在副本上）；正式提交仍须按提交时
   的当时状态重新校验，预演结果不保证可提交。
+
+跨规程版本覆盖检查
+------------------
+调度员安排跨规程作业前，用 check_coverage 在同一只读快照内按全体编号的
+版本端点切分作业区间，逐段返回每个编号的有效版本号、正文或缺口，并标出
+因撤回导致的恢复、区间外空档与版本切换；相邻段仅在整组结果完全相同时
+合并。编号不存在、时间非法或知悉时刻晚于当前时刻均拒绝；全程只读。
 """
 from __future__ import annotations
 
@@ -1332,6 +1339,190 @@ def resolve_closure_plan(number_raw: str,
             "known_as_of": known_as_of,
             "count": len(segments),
             "available": all(seg["available"] for seg in segments),
+            "segments": segments}
+
+
+# ---------------------------------------------------------------- 跨规程版本覆盖检查
+
+
+def check_coverage(numbers_raw, work_start_raw: str, work_end_raw: str,
+                   known_as_of_raw: str) -> dict:
+    """调度员安排跨规程作业前的版本覆盖检查（只读，不写任何历史）。
+
+    输入非空且不重复的规程编号、非空作业区间 ``[work_start, work_end)`` 与
+    知悉时刻（必填，不得晚于服务端当前时刻）。在**同一只读快照**内：
+
+    * 收集各编号在该知悉时刻前已发布版本的适用区间端点（含已撤回版本的
+      端点——"因撤回恢复父版本"的区间边界只能由它们圈定），与作业区间
+      求交后排序，把作业区间切成首尾相接、互不重叠的左闭右开片段；
+    * 逐段以片段起点为代表作业时刻，按与 /effective 完全一致的可见性
+      （``published_at <= k`` 且未撤回或 ``withdrawn_at >= k``）与最深链
+      语义解析每个编号的有效版本：有则给出版本号与正文，无则记为缺口
+      （``gap=true``，即该编号在片段内无适用正文的空档）；
+    * 标记：``restored_by_withdrawal``（该片段的有效版本是因更正被撤回
+      而恢复的祖先版本）、``switched``（相对上一片段发生版本切换）；
+      片段级汇总 ``version_switch`` / ``has_gap`` / ``restored``，顶层
+      ``fully_covered`` 仅在全区间全部编号均有适用正文时为 true；
+    * 相邻片段仅在整组结果（全部编号的有效版本与恢复标记）完全相同时
+      合并；被中间状态隔开的相同片段不跨段合并。
+
+    编号不存在（404 procedure_not_found）、编号重复（422
+    duplicate_coverage_number）、时间非法（422 invalid_time /
+    invalid_interval）、知悉时刻晚于服务端当前时刻（422
+    known_as_of_in_future）均直接拒绝；全程只读、不改变历史。
+    """
+    try:
+        work_start = parse_canonical(work_start_raw, "work_start")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_start"})
+    try:
+        work_end = parse_canonical(work_end_raw, "work_end")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_end"})
+    if not work_start < work_end:
+        raise errors.invalid_interval(
+            work_start, work_end,
+            "作业区间非法：work_start 必须严格早于 work_end（区间为 [起, 止) 且长度大于 0）")
+    try:
+        known_as_of = parse_canonical(known_as_of_raw, "known_as_of")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "known_as_of"})
+
+    if not numbers_raw:
+        raise DomainError("validation_error",
+                          "规程编号列表不能为空：覆盖检查至少需要一个规程编号",
+                          422, {"field": "numbers"})
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(numbers_raw):
+        number = raw.strip() if isinstance(raw, str) else ""
+        if not number:
+            raise DomainError("invalid_number", "规程编号不能为空字符串",
+                              422, {"field": "numbers", "index": i})
+        if number in seen:
+            raise errors.duplicate_coverage_number(number, i)
+        seen.add(number)
+        cleaned.append(number)
+
+    with read_snapshot() as conn:
+        # 只读路径使用不触碰写状态的墙上时钟（与复核接口同理）。
+        server_now = now_canonical()
+        if known_as_of > server_now:
+            raise errors.known_as_of_in_future(known_as_of, server_now)
+
+        procs: list[sqlite3.Row] = []
+        for i, number in enumerate(cleaned):
+            proc = _fetch_procedure(conn, number)
+            if proc is None:
+                raise errors.coverage_procedure_not_found(number, i)
+            procs.append(proc)
+
+        # 知悉时刻前已发布的全部版本（含已撤回版本，附撤回时刻）：可见版本
+        # 端点决定有效版本的切换点，已撤回版本端点决定"恢复"标记的边界。
+        per_number: list[dict] = []
+        bounds = {work_start, work_end}
+        for proc in procs:
+            rows = conn.execute(
+                """
+                SELECT v.*, w.withdrawn_at AS withdrawn_at
+                  FROM versions v
+                  LEFT JOIN withdrawals w ON w.version_id = v.id
+                 WHERE v.procedure_id = ? AND v.published_at <= ?
+                """,
+                (proc["id"], known_as_of)).fetchall()
+            for v in rows:
+                if v["valid_end"] <= work_start or work_end <= v["valid_start"]:
+                    continue                        # 与作业区间不相交
+                bounds.add(max(v["valid_start"], work_start))
+                bounds.add(min(v["valid_end"], work_end))
+            per_number.append({
+                "rows": rows,
+                "by_id": {v["id"]: v for v in rows},
+                "visible": [r for r in rows
+                            if r["withdrawn_at"] is None
+                            or r["withdrawn_at"] >= known_as_of],
+                "depth_cache": {},
+            })
+        ordered = sorted(bounds)
+
+        # 逐段解析：每个编号取片段起点的有效版本与"撤回恢复"标记。
+        # 恢复判定：忽略撤回可见性时的最深版本是已撤回版本（撤回时刻早于
+        # 知悉时刻），此时实际生效的是其祖先版本，即"因撤回导致的恢复"。
+        raw_segments: list[tuple[str, str, tuple]] = []
+        for s, e in zip(ordered, ordered[1:]):
+            group = []
+            for entry in per_number:
+                best = _effective_at(s, entry["visible"], entry["by_id"],
+                                     entry["depth_cache"])
+                deepest = _effective_at(s, entry["rows"], entry["by_id"],
+                                        entry["depth_cache"])
+                restored = (best is not None and deepest is not None
+                            and deepest["withdrawn_at"] is not None
+                            and deepest["withdrawn_at"] < known_as_of)
+                group.append((best["id"] if best is not None else None,
+                              restored))
+            raw_segments.append((s, e, tuple(group)))
+
+        # 相邻段仅在整组结果（全部编号的有效版本与恢复标记）完全相同时合并。
+        merged: list[list] = []
+        for s, e, group in raw_segments:
+            if merged and merged[-1][1] == s and merged[-1][2] == group:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e, group])
+
+        segments: list[dict] = []
+        prev_group: tuple | None = None
+        for s, e, group in merged:
+            items: list[dict] = []
+            for idx, (number, entry) in enumerate(zip(cleaned, per_number)):
+                vid, restored = group[idx]
+                switched = (prev_group is not None
+                            and vid != prev_group[idx][0])
+                row = entry["by_id"].get(vid) if vid is not None else None
+                if row is None:
+                    items.append({"number": number, "revision": None,
+                                  "body": None, "valid_start": None,
+                                  "valid_end": None,
+                                  "supersedes_revision": None,
+                                  "published_at": None,
+                                  "gap": True,
+                                  "restored_by_withdrawal": False,
+                                  "switched": switched})
+                    continue
+                parent_rev = None
+                if row["supersedes_id"] is not None:
+                    parent = entry["by_id"].get(row["supersedes_id"])
+                    if parent is not None:
+                        parent_rev = parent["revision"]
+                items.append({"number": number, "revision": row["revision"],
+                              "body": row["body"],
+                              "valid_start": row["valid_start"],
+                              "valid_end": row["valid_end"],
+                              "supersedes_revision": parent_rev,
+                              "published_at": row["published_at"],
+                              "gap": False,
+                              "restored_by_withdrawal": restored,
+                              "switched": switched})
+            segments.append({
+                "start": s, "end": e,
+                "version_switch": (prev_group is not None
+                                   and any(it["switched"] for it in items)),
+                "has_gap": any(it["gap"] for it in items),
+                "restored": any(it["restored_by_withdrawal"]
+                                for it in items),
+                "items": items})
+            prev_group = group
+
+    return {"numbers": cleaned,
+            "work_start": work_start,
+            "work_end": work_end,
+            "known_as_of": known_as_of,
+            "count": len(segments),
+            "fully_covered": all(not seg["has_gap"] for seg in segments),
             "segments": segments}
 
 

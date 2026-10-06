@@ -72,3 +72,12 @@ class PackageRequest(StrictModel):
     known_as_of: str = Field(..., description="知悉时刻（不得晚于服务端当前时刻），ISO-8601 带时区")
     numbers: list[str] = Field(..., min_length=1,
                                description="规程编号列表，至少 1 个且不得重复")
+
+
+class CoverageCheckRequest(StrictModel):
+    """跨规程版本覆盖检查：一组规程编号 + 非空作业区间 + 知悉时刻（只读）。"""
+    numbers: list[str] = Field(..., min_length=1,
+                               description="规程编号列表，至少 1 个且不得重复")
+    work_start: str = Field(..., description="作业区间起点（含），ISO-8601 带时区")
+    work_end: str = Field(..., description="作业区间终点（不含），必须严格晚于起点")
+    known_as_of: str = Field(..., description="知悉时刻（不得晚于服务端当前时刻），ISO-8601 带时区")
